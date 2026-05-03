@@ -1,6 +1,6 @@
 """
-GAN-Style Training for Language Models (using REINFORCE)
-Same evaluation as original supervised training (logs train/val cross-entropy loss)
+Fast GAN Training for Language Models (single‑token generation)
+Same evaluation as original supervised training.
 """
 
 import os
@@ -22,15 +22,14 @@ from model import GPTConfig, GPT
 # GAN-specific hyperparameters
 disc_learning_rate = 1e-4
 gen_learning_rate = 1e-4
-disc_train_ratio = 1               # number of discriminator updates per gen update
-gen_batch_size = 4                 # batch size for REINFORCE (sequences generated from scratch)
-reward_smoothing = 0.9             # baseline decay
+disc_train_ratio = 1               # discriminator updates per generator update
+reward_smoothing = 0.9
 max_grad_norm_disc = 1.0
 max_grad_norm_gen = 1.0
 
 # -----------------------------------------------------------------------------
 # default config values (original)
-out_dir = 'out_gan'
+out_dir = 'out_gan_fast'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -38,8 +37,8 @@ eval_only = False
 always_save_checkpoint = True
 init_from = 'scratch'
 wandb_log = False
-wandb_project = 'owt_gan'
-wandb_run_name = 'gpt2_gan'
+wandb_project = 'owt_gan_fast'
+wandb_run_name = 'gpt2_gan_fast'
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8
 batch_size = 12
@@ -49,7 +48,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0
 bias = False
-learning_rate = 6e-4          # not used directly for generator anymore, but kept for scheduler
+learning_rate = 6e-4          # not used for generator, but here for compatibility
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -65,13 +64,13 @@ compile = True
 max_iters = 600000
 
 # -----------------------------------------------------------------------------
-# parse config overrides from command line / configurator
+# parse config overrides
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read())
 config = {k: globals()[k] for k in config_keys}
 
 # -----------------------------------------------------------------------------
-# DDP init
+# DDP init (MUST be before any use of ddp variable)
 ddp = int(os.environ.get('RANK', -1)) != -1
 if ddp:
     init_process_group(backend=backend)
@@ -93,7 +92,6 @@ tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * bl
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 
-# set seed
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -119,7 +117,7 @@ def get_batch(split):
     return x, y
 
 # -----------------------------------------------------------------------------
-# meta info (vocab size)
+# meta info
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
 if os.path.exists(meta_path):
@@ -141,7 +139,7 @@ if init_from == 'scratch':
     generator = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
-    ckpt_path = os.path.join(out_dir, 'ckpt_gan.pt')
+    ckpt_path = os.path.join(out_dir, 'ckpt_gan_fast.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
@@ -149,7 +147,7 @@ elif init_from == 'resume':
     gptconf = GPTConfig(**model_args)
     generator = GPT(gptconf)
     generator.load_state_dict(checkpoint['generator'])
-    # also restore iter_num, baseline etc. if stored
+    # also restore iter_num, reward_baseline if stored
 else:
     raise ValueError(f"init_from {init_from} not supported in GAN mode (only 'scratch' or 'resume')")
 
@@ -189,7 +187,7 @@ discriminator = SimpleDiscriminator(model_args['vocab_size'], block_size, n_embd
 discriminator.to(device)
 
 # -----------------------------------------------------------------------------
-# Optimizer helper (for discriminator)
+# Optimizer helper
 def create_optimizer(model, weight_decay, learning_rate, betas, device_type):
     decay_params = []
     no_decay_params = []
@@ -212,54 +210,40 @@ def create_optimizer(model, weight_decay, learning_rate, betas, device_type):
 optimizer_gen = generator.configure_optimizers(weight_decay, gen_learning_rate, (beta1, beta2), device_type)
 optimizer_disc = create_optimizer(discriminator, weight_decay, disc_learning_rate, (beta1, beta2), device_type)
 
-# Grad scalers for fp16
 scaler_gen = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 scaler_disc = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# Wrap for DDP
 if ddp:
     generator = DDP(generator, device_ids=[ddp_local_rank])
     discriminator = DDP(discriminator, device_ids=[ddp_local_rank])
 
 # -----------------------------------------------------------------------------
-# Helper functions for GAN training
-@torch.no_grad()
-def generate_sequences(model, prompt_tokens, max_new_tokens):
-    model.eval()
-    generated = prompt_tokens.clone()
-    for _ in range(max_new_tokens):
-        logits, _ = model(generated[:, -block_size:])
-        next_token_logits = logits[:, -1, :]
-        probs = F.softmax(next_token_logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        generated = torch.cat([generated, next_token], dim=1)
-    model.train()
-    return generated
+# Fast GAN helpers (single token generation)
+def sample_next_token(generator, prefix_tokens, ctx):
+    with ctx:
+        logits, _ = generator(prefix_tokens)
+    next_logits = logits[:, -1, :]
+    probs = F.softmax(next_logits, dim=-1)
+    dist = torch.distributions.Categorical(probs)
+    next_token = dist.sample()
+    logprob = dist.log_prob(next_token)
+    return next_token, logprob
 
-def reinforce_update(generator, discriminator, optimizer_gen, reward_baseline, device, batch_size, block_size, ctx, scaler):
+def reinforce_update_single_token(generator, discriminator, optimizer_gen, reward_baseline,
+                                   real_batch_fn, device, ctx, scaler):
     generator.train()
     discriminator.eval()
-    start_tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
-    generated = start_tokens
-    logprobs = []
-    for step in range(block_size - 1):
-        with ctx:
-            logits, _ = generator(generated[:, -block_size:])
-        next_logits = logits[:, -1, :]
-        probs = F.softmax(next_logits, dim=-1)
-        dist = torch.distributions.Categorical(probs)
-        next_token = dist.sample()
-        logprob = dist.log_prob(next_token)
-        generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
-        logprobs.append(logprob)
+    real_x, _ = real_batch_fn()
+    prefix = real_x[:, :-1]
+    sampled_token, logprob = sample_next_token(generator, prefix, ctx)
+    completed = torch.cat([prefix, sampled_token.unsqueeze(1)], dim=1)
     with torch.no_grad():
-        disc_logits = discriminator(generated)
-        rewards = torch.sigmoid(disc_logits)
+        disc_logit = discriminator(completed)
+        reward = torch.sigmoid(disc_logit)
     baseline = reward_baseline[0]
-    advantages = rewards - baseline
-    reward_baseline[0] = reward_baseline[0] * reward_smoothing + rewards.mean().item() * (1 - reward_smoothing)
-    logprobs_tensor = torch.stack(logprobs, dim=1)
-    loss_gen = -(logprobs_tensor * advantages.unsqueeze(1)).sum(dim=1).mean()
+    advantage = reward - baseline
+    reward_baseline[0] = baseline * reward_smoothing + reward.mean().item() * (1 - reward_smoothing)
+    loss_gen = -(logprob * advantage).mean()
     optimizer_gen.zero_grad(set_to_none=True)
     scaler.scale(loss_gen).backward()
     if max_grad_norm_gen != 0.0:
@@ -267,15 +251,17 @@ def reinforce_update(generator, discriminator, optimizer_gen, reward_baseline, d
         torch.nn.utils.clip_grad_norm_(generator.parameters(), max_grad_norm_gen)
     scaler.step(optimizer_gen)
     scaler.update()
-    return rewards.mean().item()
+    return reward.mean().item(), loss_gen.item()
 
-def train_discriminator(generator, discriminator, optimizer_disc, real_batch_fn, device, batch_size, block_size, ctx, scaler):
+def train_discriminator_single_token(generator, discriminator, optimizer_disc, real_batch_fn,
+                                      device, batch_size, block_size, ctx, scaler):
     discriminator.train()
     generator.eval()
     real_x, _ = real_batch_fn()
+    prefix = real_x[:, :-1]
     with torch.no_grad():
-        start_tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
-        fake_x = generate_sequences(generator, start_tokens, block_size - 1)
+        sampled_token, _ = sample_next_token(generator, prefix, ctx)
+        fake_x = torch.cat([prefix, sampled_token.unsqueeze(1)], dim=1)
     real_labels = torch.ones(batch_size, device=device)
     fake_labels = torch.zeros(batch_size, device=device)
     real_logits = discriminator(real_x)
@@ -293,7 +279,7 @@ def train_discriminator(generator, discriminator, optimizer_disc, real_batch_fn,
     return loss_disc.item()
 
 # -----------------------------------------------------------------------------
-# Original evaluation function (exactly as in nanoGPT)
+# Original evaluation function (same as supervised)
 @torch.no_grad()
 def estimate_loss(model):
     out = {}
@@ -310,52 +296,36 @@ def estimate_loss(model):
     return out
 
 # -----------------------------------------------------------------------------
-# Training loop with same evaluation as original
+# Training loop (fast single‑token GAN)
 iter_num = 0
-reward_baseline = [0.5]   # mutable list
+reward_baseline = [0.5]
 raw_gen = generator.module if ddp else generator
 raw_disc = discriminator.module if ddp else discriminator
 
-print("Starting GAN training loop...")
+print("Starting fast GAN training (single‑token generation)...")
 while True:
-    # Train discriminator
+    # Discriminator updates
     for _ in range(disc_train_ratio):
-        disc_loss = train_discriminator(raw_gen, raw_disc, optimizer_disc,
-                                        lambda: get_batch('train'), device,
-                                        batch_size, block_size, ctx, scaler_disc)
-    # Train generator with REINFORCE
-    avg_reward = reinforce_update(raw_gen, raw_disc, optimizer_gen, reward_baseline,
-                                  device, gen_batch_size, block_size, ctx, scaler_gen)
-    
-    # --- Logging: supervised train loss for comparison ---
-    # Compute cross-entropy on a fresh real batch (same as original would have)
+        disc_loss = train_discriminator_single_token(
+            raw_gen, raw_disc, optimizer_disc, lambda: get_batch('train'),
+            device, batch_size, block_size, ctx, scaler_disc
+        )
+    # Generator REINFORCE update (one token per sequence)
+    avg_reward, gen_loss = reinforce_update_single_token(
+        raw_gen, raw_disc, optimizer_gen, reward_baseline,
+        lambda: get_batch('train'), device, ctx, scaler_gen
+    )
+    # Log supervised training loss for comparison
     with torch.no_grad():
         real_x, real_y = get_batch('train')
-        _, supervised_train_loss = raw_gen(real_x, real_y)   # cross-entropy
-        supervised_train_loss = supervised_train_loss.item()
-    
+        _, sup_loss = raw_gen(real_x, real_y)
+        sup_loss_val = sup_loss.item()
     if iter_num % log_interval == 0 and master_process:
-        print(f"iter {iter_num:6d}: sup_train_loss {supervised_train_loss:.4f}, "
-              f"disc_loss={disc_loss:.4f}, avg_reward={avg_reward:.4f}")
-        if wandb_log:
-            import wandb
-            wandb.log({
-                "iter": iter_num,
-                "train/supervised_loss": supervised_train_loss,
-                "discriminator/loss": disc_loss,
-                "generator/avg_reward": avg_reward,
-            })
-    
-    # --- Evaluation (exactly as original) ---
+        print(f"iter {iter_num:6d}: sup_train_loss {sup_loss_val:.4f}, "
+              f"disc_loss={disc_loss:.4f}, avg_reward={avg_reward:.4f}, gen_loss={gen_loss:.4f}")
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss(raw_gen)
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "eval/train_loss": losses['train'],
-                "eval/val_loss": losses['val'],
-            })
-        # Save checkpoint
         checkpoint = {
             'generator': raw_gen.state_dict(),
             'discriminator': raw_disc.state_dict(),
@@ -365,9 +335,9 @@ while True:
             'iter_num': iter_num,
             'reward_baseline': reward_baseline[0],
         }
-        torch.save(checkpoint, os.path.join(out_dir, 'ckpt_gan.pt'))
-        print(f"checkpoint saved to {out_dir}/ckpt_gan.pt")
-    
+        torch.save(checkpoint, os.path.join(out_dir, 'ckpt_gan_fast.pt'))
+        if always_save_checkpoint:
+            print(f"checkpoint saved to {out_dir}/ckpt_gan_fast.pt")
     iter_num += 1
     if iter_num > max_iters:
         break
