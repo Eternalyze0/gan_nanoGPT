@@ -1,5 +1,5 @@
 # GAN nanoGPT
-GAN-style training for nanoGPT.
+GAN-style training for nanoGPT. Only the last token is generated per sequence to keep speed comparable to the original.
 
 ## Usage
 
