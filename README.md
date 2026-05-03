@@ -1,4 +1,4 @@
-# gan_nanoGPT
+# GAN nanoGPT
 GAN-style training for nanoGPT.
 
 ## Usage
